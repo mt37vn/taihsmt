@@ -1,0 +1,42 @@
+name: Bot Mua Sam Cong Daily
+on:
+  schedule:
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          pip install requests playwright selenium webdriver-manager
+          python -m playwright install chromium
+      - name: Run Bot
+        env:
+          TRELLO_API_KEY: ${{ secrets.TRELLO_API_KEY }}
+          TRELLO_TOKEN: ${{ secrets.TRELLO_TOKEN }}
+          TRELLO_LIST_ID: ${{ secrets.TRELLO_LIST_ID }}
+          DOWNLOAD_DIR: downloads
+          AUTO_DOWNLOAD: "true"
+          HEADLESS_MODE: "True"
+        run: python bot_thau.py
+      - name: Upload downloaded attachments
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bid-attachments
+          path: downloads/
+          if-no-files-found: ignore
+      - name: Commit and push changes
+        run: |
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+          git add processed_ids.txt discarded_ids.txt
+          git commit -m "Update processed bidding IDs" || exit 0
+          git push
