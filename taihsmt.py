@@ -1,4 +1,4 @@
-import os, time, re, json, random, zipfile, threading, subprocess, ssl
+import os, time, re, json, random, zipfile, threading, ssl
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import requests as req_lib
@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+from playwright.sync_api import sync_playwright
 
 app = FastAPI(title="VNeGP Downloader")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -23,6 +24,46 @@ _scanner_lock = threading.Lock()
 _last_scan_time = 0.0
 MIN_SCAN_INTERVAL = 30
 
+# --- Playwright lifecycle ---
+_pw = None
+_pw_browser = None
+
+PW_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+def _new_page():
+    global _pw, _pw_browser
+    try:
+        if _pw_browser and _pw_browser.is_connected():
+            return _pw_browser.new_page(user_agent=PW_USER_AGENT)
+    except:
+        pass
+    if _pw:
+        try: _pw.stop()
+        except: pass
+    _pw = sync_playwright().start()
+    _pw_browser = _pw.chromium.launch(headless=True)
+    return _pw_browser.new_page(user_agent=PW_USER_AGENT)
+
+def _close_browser():
+    global _pw, _pw_browser
+    if _pw_browser:
+        try: _pw_browser.close()
+        except: pass
+        _pw_browser = None
+    if _pw:
+        try: _pw.stop()
+        except: pass
+        _pw = None
+
+@app.on_event("shutdown")
+def _shutdown():
+    _close_browser()
+
+# --- XHR Interception JS ---
 XHR_INTERCEPT_JS = """
 window.__xhrResponses = window.__xhrResponses || [];
 if (!window.__xhrHooked) {
@@ -58,7 +99,6 @@ if (!window.__xhrHooked) {
 }
 """
 
-
 PORTAL_BASE = "https://muasamcong.mpi.gov.vn"
 HSMT_API_PATH = "/o/egp-portal-contractor-selection-v2/services/lcnt_tbmt_hsmt"
 
@@ -73,22 +113,394 @@ class _LegacySSLAdapter(HTTPAdapter):
         return super().init_poolmanager(*args, **kwargs)
 
 
-def _extract_hsmt_params(driver):
-    from urllib.parse import urlparse, parse_qs
-    current_url = driver.current_url
-    parsed = urlparse(current_url)
-    qs = parse_qs(parsed.query)
-    notify_id = (qs.get("notifyId", [None]) or [None])[0]
-    process_apply = (qs.get("processApply", ["LDT"]) or ["LDT"])[0]
-    if not notify_id:
-        raise Exception("Cannot extract notifyId from page URL")
-    auth_token = driver.execute_script("return Liferay.authToken;")
-    if not auth_token:
-        raise Exception("Cannot extract Liferay.authToken from page")
-    cookies = driver.get_cookies()
-    cookie_dict = {c["name"]: c["value"] for c in cookies if c.get("name") and c.get("value")}
-    return notify_id, process_apply, auth_token, cookie_dict
+# ==========================================
+# Section 2: HÀM HỖ TRỢ (from user's bot, verbatim)
+# ==========================================
 
+def safe_get_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return " ".join(map(str, value))
+    return str(value)
+
+def format_vnd(x):
+    if x is None:
+        return ""
+    if isinstance(x, (int, float)):
+        return f"{x:,.0f} VND"
+    try:
+        n = float(str(x).replace(",", "").strip())
+        return f"{n:,.0f} VND"
+    except:
+        return str(x)
+
+def normalize_price(x):
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    try:
+        cleaned = str(x).replace(",", "").replace("VND", "").strip()
+        return float(cleaned)
+    except:
+        return None
+
+def _try_parse_json_maybe(s):
+    if not s:
+        return None
+    if isinstance(s, dict):
+        return s
+    if isinstance(s, str):
+        ss = s.strip()
+        try:
+            return json.loads(ss)
+        except:
+            return None
+    return None
+
+def parse_date_flexible(date_str):
+    if not date_str:
+        return None
+    formats = ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%d/%m/%Y %H:%M", "%d/%m/%Y"]
+    for fmt in formats:
+        try:
+            s = date_str
+            if "T" in s and "." not in s:
+                s = s[:19]
+            return datetime.strptime(s, fmt)
+        except:
+            continue
+    return None
+
+
+# ==========================================
+# Section 3: KHLCNT LOOKUP LOGIC (from user's bot, verbatim)
+# ==========================================
+
+def build_khlcnt_detail_url(plan_no: str, plan_id: str) -> str:
+    """URL trang chi tiết KHLCNT"""
+    # Nếu có ID thì dùng kèm, nếu không thì chỉ dùng planNo (hy vọng web tự redirect)
+    base_url = (
+        "https://muasamcong.mpi.gov.vn/en/web/guest/contractor-selection?"
+        "p_p_id=egpportalcontractorselectionv2_WAR_egpportalcontractorselectionv2"
+        "&p_p_lifecycle=0&p_p_state=normal&p_p_mode=view"
+        "&_egpportalcontractorselectionv2_WAR_egpportalcontractorselectionv2_render=detail-v2"
+        "&type=es-plan-project-p&step=tbmt&stepCode=plan-step-1"
+        f"&planNo={plan_no}"
+    )
+    if plan_id:
+        base_url += f"&id={plan_id}"
+        
+    return base_url + "&notifyId=undefined&notifyNo=undefined&bidMode=undefined&bidForm=undefined"
+
+def fetch_khlcnt_detail_json(page, plan_no: str, plan_id: str):
+    url = build_khlcnt_detail_url(plan_no, plan_id)
+    def is_target_xhr(resp):
+        try:
+            return (
+                resp.status == 200
+                and "application/json" in (resp.headers or {}).get("content-type", "")
+                and "contractor-selection" in resp.url
+            )
+        except:
+            return False
+            
+    # Capture Plan Detail Response
+    captured_plan_data = []
+    def handle_plan_response(response):
+        try:
+             if is_target_xhr(response):
+                # print(f"      📡 Captured Plan API: {response.url}")
+                json_data = response.json()
+                captured_plan_data.append(json_data)
+        except:
+            pass
+
+    page.on("response", handle_plan_response)
+
+    try:
+        page.goto(url, timeout=20000)
+        page.wait_for_timeout(2000)
+    except Exception as e:
+        print(f"      ⚠️ Fetch Plan Nav Warning: {e}")
+        # Don't return None yet, check if we captured data!
+
+    try:
+        if captured_plan_data:
+            return captured_plan_data[0]
+            
+        return None
+    finally:
+        page.remove_listener("response", handle_plan_response)
+
+def fetch_tbmt_detail_json(page, tbmt_id):
+    """
+    Vào trang chi tiết TBMT để lấy thông tin (đặc biệt là ID của KHLCNT).
+    """
+    # URL detail TBMT (dùng render=detail-v2)
+    # Tuy nhiên để nhẹ, ta có thể gọi thẳng API nếu biết endpoint. 
+    # Nhưng để an toàn (bắt chước user), ta navigate vào trang detail.
+    url = (
+        "https://muasamcong.mpi.gov.vn/web/guest/contractor-selection?"
+        "p_p_id=egpportalcontractorselectionv2_WAR_egpportalcontractorselectionv2"
+        "&p_p_lifecycle=0&p_p_state=normal&p_p_mode=view"
+        "&_egpportalcontractorselectionv2_WAR_egpportalcontractorselectionv2_render=detail-v2"
+        "&type=es-notify-contractor&step=tbmt"
+        f"&id={tbmt_id}&notifyId={tbmt_id}"
+    )
+    
+    # Predicate bắt JSON detail
+    # Predicate bắt JSON detail
+    # Update: Dùng list để hứng tất cả response JSON
+    captured_data = []
+    
+    def handle_response(response):
+        try:
+            if (
+                response.status == 200 
+                and "application/json" in (response.headers or {}).get("content-type", "")
+                and "contractor-selection" in response.url
+            ):
+                # print(f"      📡 Captured: {response.url}")
+                json_data = response.json()
+                captured_data.append(json_data)
+                
+                # DEBUG: Nếu là API tiềm năng, in luôn ra màn hình
+                if "lcnt_tbmt_ttc_ldt" in response.url:
+                    # print("      📡 Captured TBMT Detail API")
+                    pass
+        except:
+            pass
+
+    # Attach listener
+    page.on("response", handle_response)
+
+    try:
+        # Không dùng expect_response nữa mà dùng wait
+        # page.goto có thể timeout nhưng ta vẫn muốn check captured_data
+        page.goto(url, timeout=20000)
+        page.wait_for_timeout(3000) # Đợi thêm tí cho chắc
+    except Exception as e:
+        print(f"      ⚠️ Page load warning: {e}")
+        # Không return None ngay, mà check captured_data xem vớt vát được gì không
+    
+    try:
+        # Detach listener (optional)
+        page.remove_listener("response", handle_response)
+        
+        if captured_data:
+            # Tìm JSON xịn nhất trong đống captured
+            # Ưu tiên 1: Có bidpPlanDetail (là cái ta cần)
+            for d in captured_data:
+                if d.get('bidpPlanDetail') or (d.get('data') and d.get('data').get('bidpPlanDetail')):
+                    return d
+            
+            # Ưu tiên 2: Có planId ở root hoặc data (backup cũ)
+            for d in captured_data:
+                data_obj = d.get('data') or d
+                if data_obj.get('planId') or data_obj.get('idKhlcnt'):
+                    return d
+        
+        # Fallback return anything
+        return captured_data[0] if captured_data else None
+
+    except Exception as e:
+        print(f"      ⚠️ Processing TBMT Detail failed: {e}")
+        return None
+
+def find_plan_id_by_no(page, plan_no):
+    """
+    Search tìm Plan ID từ Plan No (Fallback logic - Homepage).
+    """
+    print(f"      🔎 [Fallback] Looking up Plan info for: {plan_no}")
+    try:
+        # 1. Vào trang chủ (render=index) chứa selector radio-khlcnt như user cung cấp
+        search_url = "https://muasamcong.mpi.gov.vn/web/guest/contractor-selection?render=index"
+        page.goto(search_url, wait_until="domcontentloaded")
+        
+        # 2. Click Radio Button KHLCNT
+        # Selector user cung cấp: <label for="radio-khlcnt"><input id="radio-khlcnt" ...></label>
+        try:
+            # Click vào label là chuẩn nhất
+            page.locator("label[for='radio-khlcnt']").first.click(timeout=5000)
+            
+            # Double check: kiểm tra xem input có checked không
+            is_checked = page.evaluate("document.querySelector('#radio-khlcnt').checked")
+            if not is_checked:
+                print("        ⚠️ Radio not checked after label click. Forcing JS click...")
+                page.evaluate("document.querySelector('#radio-khlcnt').click()")
+                
+        except Exception as e:
+            print(f"        ⚠️ Click radio KHLCNT failed: {e}")
+            # Fallback cuối cùng: Force click input
+            try:
+                page.locator("#radio-khlcnt").click(timeout=2000, force=True)
+            except:
+                pass
+            
+        page.wait_for_timeout(2000) # Chờ UI switch mode
+            
+        # 3. Nhập từ khóa
+        search_input = 'input[name="keyword"]'
+        page.wait_for_selector(search_input, timeout=15000)
+        page.fill(search_input, plan_no)
+        
+        # 4. Trigger Search
+        with page.expect_response(lambda r: "contractor-selection" in r.url and r.status == 200, timeout=15000) as resp:
+            page.keyboard.press("Enter")
+            
+        data = resp.value.json()
+        items = data.get('data') or data.get('page', {}).get('content') or []
+        
+        # 5. Tìm chính xác planNo
+        for item in items:
+            p_no = safe_get_text(item.get('planNo') or item.get('notifyNo')).strip()
+            if p_no == plan_no:
+                return safe_get_text(item.get('id')), item
+                
+        return None, None
+    except Exception as e:
+        print(f"      ⚠️ Lookup failed: {e}")
+        return None, None
+
+def _extract_price(pkg):
+    price = pkg.get("bidPrice") or pkg.get("bidEstimatePrice") or pkg.get("planItemPrice")
+    unit = pkg.get("bidPriceUnit") or pkg.get("bidPriceUnitName") or pkg.get("currencyCode")
+    return price, unit
+
+def get_khlcnt_price_from_plan(kh_page, plan_cache, plan_no, tbmt_notify_no, tbmt_id):
+    """
+    Tìm giá dự toán trong Plan.
+    Flow mới:
+    1. Vào chi tiết TBMT (dùng tbmt_id) -> Lấy planId.
+    2. Vào chi tiết Plan (dùng planId hoặc planNo nếu không có ID) -> Lấy giá.
+    """
+    if not plan_no and not tbmt_id:
+        return None, None, None
+        
+    # Check cache
+    guarantee_val = None
+    if plan_no and plan_no in plan_cache:
+        plan_detail = plan_cache[plan_no]
+    else:
+        # 1. Tìm ID của Plan từ chi tiết TBMT (Cố gắng lấy ID xịn)
+        plan_id = None
+        
+        # Thử lấy ID từ tbmt detail
+        try:
+            print(f"      🔗 Fetching TBMT Detail to get Plan ID...")
+            tbmt_detail = fetch_tbmt_detail_json(kh_page, tbmt_id)
+            if tbmt_detail:
+                data_obj = tbmt_detail.get('data') or tbmt_detail
+                
+                # Extract Guarantee Value (Bid Security)
+                # Check bidNotification or bidoNotifyContractorM (older/variant structures)
+                bid_notif = (
+                    data_obj.get('bidNoContractorResponse', {}).get('bidNotification') 
+                    or data_obj.get('bidoNotifyContractorM')
+                    or data_obj.get('bidNotification')
+                )
+                if bid_notif:
+                    guarantee_val = bid_notif.get('guaranteeValue')
+
+                plan_id = data_obj.get('planId') or data_obj.get('idKhlcnt')
+                
+                # Check for nested bidpPlanDetail (common in new API)
+                if data_obj.get('bidpPlanDetail'):
+                    plan_inner = data_obj['bidpPlanDetail']
+                    
+                    # Try to extract Price directly!
+                    direct_price, direct_unit = _extract_price(plan_inner)
+                    direct_price = normalize_price(direct_price)
+                    if direct_price is not None:
+                        print(f"      💰 Info: Found Price in TBMT Detail. Skipping Plan fetch.")
+                        # Simulate plan detail for cache if needed, or just return
+                        return direct_price, direct_unit, guarantee_val
+                    
+                    if not plan_id:
+                        plan_id = plan_inner.get('planId') or plan_inner.get('id')
+        except Exception as e:
+            print(f"      ⚠️ TBMT Detail parse error: {e}")
+            
+        if not plan_id:
+            print(f"      ⚠️ Missing Plan ID. Switching to Search Fallback (Homepage)...")
+            # Fallback: Search thủ công
+            plan_id, _ = find_plan_id_by_no(kh_page, plan_no)
+            
+        if not plan_id:
+            print("      ❌ Fallback failed. Cannot find Plan ID.")
+            return None, None, guarantee_val
+        
+        print(f"      ✅ Plan ID Found: {plan_id}")
+        print(f"      📂 Fetching Plan Detail (No: {plan_no}, ID: {plan_id})...")
+        plan_detail = fetch_khlcnt_detail_json(kh_page, plan_no, plan_id)
+        if plan_no:
+            plan_cache[plan_no] = plan_detail # Save to cache
+        
+    if not plan_detail:
+        return None, None, guarantee_val
+
+    # 3. Tìm gói thầu trong Plan detail khớp notifyNo
+    # Flatten list packages
+    candidates = []
+    for k in ["bidpPlanDetailToProjectList", "bidpPlanDetailList", "bidpPlanDetails"]:
+        v = plan_detail.get(k)
+        if isinstance(v, list): candidates = v; break
+    if not candidates:
+        for w in ["detailKhlcntRes", "data", "result"]:
+            v = plan_detail.get(w, {})
+            if isinstance(v, dict):
+                for k in ["bidpPlanDetailToProjectList", "bidpPlanDetailList"]:
+                    vv = v.get(k)
+                    if isinstance(vv, list): candidates = vv; break
+    
+    # Matching
+    tbmt_notify_no = tbmt_notify_no.strip()
+    price, unit = None, None
+    for pkg in candidates:
+        # Check notifyNo directly
+        if safe_get_text(pkg.get('notifyNo')).strip() == tbmt_notify_no:
+            price, unit = _extract_price(pkg)
+            price = normalize_price(price)
+            break
+            
+        # Check inside linkNotifyInfo
+        link_info = _try_parse_json_maybe(pkg.get('linkNotifyInfo'))
+        if isinstance(link_info, dict):
+            if safe_get_text(link_info.get('notifyNo')).strip() == tbmt_notify_no:
+                price, unit = _extract_price(pkg)
+                price = normalize_price(price)
+                break
+                
+    return price, unit, guarantee_val
+
+
+# === ORIGINAL HELPERS (server-only) ===
+
+_UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+
+def _is_valid_uuid(val):
+    return bool(_UUID_RE.match(str(val))) if val else False
+
+def _sprint(msg):
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        print(msg.encode("ascii", "replace").decode())
+
+def _load_tbmt_index():
+    if os.path.exists(TBMT_CACHE_FILE):
+        try:
+            with open(TBMT_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+
+def _save_tbmt_index(idx):
+    with open(TBMT_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(idx, f, ensure_ascii=False, indent=2)
 
 def _call_hsmt_api_direct(notify_id, process_apply, auth_token, cookies):
     api_url = f"{PORTAL_BASE}{HSMT_API_PATH}?token={auth_token}"
@@ -110,14 +522,6 @@ def _call_hsmt_api_direct(notify_id, process_apply, auth_token, cookies):
     if resp.status_code != 200:
         raise Exception(f"HSMT API returned HTTP {resp.status_code}: {resp.text[:200]}")
     return resp.json()
-
-
-_UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
-
-
-def _is_valid_uuid(val):
-    return bool(_UUID_RE.match(str(val))) if val else False
-
 
 def _parse_hsmt_formvalue(response_json):
     file_items = []
@@ -153,129 +557,42 @@ def _parse_hsmt_formvalue(response_json):
                 file_items.append(fi)
     return file_items
 
+def _extract_hsmt_params(page):
+    from urllib.parse import urlparse, parse_qs
+    current_url = page.url
+    parsed = urlparse(current_url)
+    qs = parse_qs(parsed.query)
+    notify_id = (qs.get("notifyId", [None]) or [None])[0]
+    process_apply = (qs.get("processApply", ["LDT"]) or ["LDT"])[0]
+    if not notify_id:
+        raise Exception("Cannot extract notifyId from page URL")
+    auth_token = page.evaluate("Liferay.authToken")
+    if not auth_token:
+        raise Exception("Cannot extract Liferay.authToken from page")
+    pw_cookies = page.context.cookies()
+    cookie_dict = {c["name"]: c["value"] for c in pw_cookies if c.get("name") and c.get("value")}
+    return notify_id, process_apply, auth_token, cookie_dict
 
-def _sprint(msg):
+def find_bid_detail_url(page, tbmt_code):
+    page.goto("https://muasamcong.mpi.gov.vn/web/guest/contractor-selection?render=index")
     try:
-        print(msg)
-    except UnicodeEncodeError:
-        print(msg.encode("ascii", "replace").decode())
-
-
-def _load_tbmt_index():
-    if os.path.exists(TBMT_CACHE_FILE):
-        try:
-            with open(TBMT_CACHE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            pass
-    return {}
-
-
-def _save_tbmt_index(idx):
-    with open(TBMT_CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(idx, f, ensure_ascii=False, indent=2)
-
-
-def _find_chrome_exe():
-    paths = [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    ]
-    for p in paths:
-        if os.path.isfile(p):
-            return p
-    import shutil as _shutil
-    found = _shutil.which("chrome")
-    if found:
-        return found
-    return None
-
-
-def _user_data_dir():
-    default = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "User Data")
-    if os.path.isdir(default):
-        return default
-    return None
-
-
-def _ensure_chrome_debugger(port=9222):
-    debugger_url = f"http://localhost:{port}"
-    try:
-        resp = req_lib.get(f"{debugger_url}/json/version", timeout=3)
-        if resp.status_code == 200:
-            _sprint(f"Chrome debugger already listening on port {port}")
-            return True
-    except:
-        pass
-
-    chrome_exe = _find_chrome_exe()
-    if not chrome_exe:
-        raise Exception(
-            "Chrome not found. Start Chrome manually with: "
-            f'chrome.exe --remote-debugging-port={port}'
-        )
-
-    udd = _user_data_dir()
-    if not udd:
-        raise Exception(
-            "Cannot determine Chrome user data directory. "
-            f"Start Chrome manually with: chrome.exe --remote-debugging-port={port}"
-        )
-
-    _sprint(f"Restarting Chrome with debugger on port {port} (user data: {udd})...")
-    import shutil as _shutil
-    chrome_kill = _shutil.which("taskkill")
-    if chrome_kill:
-        subprocess.run(
-            [chrome_kill, "/F", "/IM", "chrome.exe"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-    time.sleep(3)
-
-    subprocess.Popen(
-        [chrome_exe, f"--remote-debugging-port={port}", f"--user-data-dir={udd}"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    deadline = time.time() + 20
-    while time.time() < deadline:
-        try:
-            resp = req_lib.get(f"{debugger_url}/json/version", timeout=2)
-            if resp.status_code == 200:
-                _sprint("Chrome debugger ready")
-                return False
-        except:
-            pass
-        time.sleep(1)
-    raise Exception(f"Chrome did not start debugging on port {port} within 20s")
-
-
-def find_bid_detail_url(driver, tbmt_code):
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.keys import Keys
-    driver.get("https://muasamcong.mpi.gov.vn/web/guest/contractor-selection?render=index")
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    try:
-        WebDriverWait(driver, 8).until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[name='keyword'], input.form-control, input[type='text']")))
+        page.wait_for_selector("input[name='keyword'], input.form-control, input[type='text']", timeout=8000)
     except:
         time.sleep(5)
 
     search_input = None
     for sel in ["input[name='keyword']", "input.form-control", "input[type='text']"]:
         try:
-            for el in driver.find_elements(By.CSS_SELECTOR, sel):
-                if el.is_displayed():
-                    search_input = el
-                    break
-            if search_input:
+            el = page.locator(sel).first
+            if el.is_visible():
+                search_input = el
                 break
         except:
             continue
     if not search_input:
         try:
-            el = driver.find_element(By.XPATH, "//input")
-            if el and el.is_displayed():
+            el = page.locator("input").first
+            if el.is_visible():
                 search_input = el
         except:
             pass
@@ -283,15 +600,22 @@ def find_bid_detail_url(driver, tbmt_code):
         raise Exception("Cannot find search input")
 
     search_input.click()
-    time.sleep(0.5)
-    search_input.clear()
     time.sleep(0.3)
+    search_input.fill("")
     for ch in tbmt_code:
-        search_input.send_keys(ch)
-        time.sleep(random.uniform(0.15, 0.35))
-    time.sleep(1.5)
-    search_input.send_keys(Keys.ENTER)
-    time.sleep(5)
+        page.keyboard.type(ch, delay=random.randint(80, 200))
+    time.sleep(1)
+
+    with page.expect_response(
+        lambda r: "contractor-selection" in r.url and r.status == 200,
+        timeout=15000,
+    ) as resp_info:
+        page.keyboard.press("Enter")
+    try:
+        resp_info.value
+    except:
+        pass
+    time.sleep(4)
 
     result_link = None
     for sel in [
@@ -301,68 +625,75 @@ def find_bid_detail_url(driver, tbmt_code):
         "a.tbmt-title",
     ]:
         try:
-            for a in driver.find_elements(By.CSS_SELECTOR, sel):
-                if tbmt_code in (a.get_attribute("href") or "") or tbmt_code in a.text:
-                    result_link = a
+            links = page.locator(sel)
+            count = links.count()
+            for i in range(count):
+                link = links.nth(i)
+                href = link.get_attribute("href") or ""
+                text = link.text_content() or ""
+                if tbmt_code in href or tbmt_code in text:
+                    result_link = link
                     break
             if result_link:
                 break
         except:
             continue
     if not result_link:
-        for a in driver.find_elements(By.XPATH, "//a[contains(@href, 'contractor-selection')]"):
-            if tbmt_code in (a.get_attribute("href") or "") or tbmt_code in a.text:
-                result_link = a
-                break
+        try:
+            links = page.locator("a[href*='contractor-selection']")
+            count = links.count()
+            for i in range(count):
+                link = links.nth(i)
+                href = link.get_attribute("href") or ""
+                text = link.text_content() or ""
+                if tbmt_code in href or tbmt_code in text:
+                    result_link = link
+                    break
+        except:
+            pass
     if not result_link:
         raise Exception(f"No result found for {tbmt_code}")
 
-    driver.execute_script("arguments[0].scrollIntoView(true);", result_link)
-    time.sleep(2)
-    driver.execute_script("arguments[0].click();", result_link)
+    result_link.scroll_into_view_if_needed()
+    time.sleep(1)
+    result_link.click()
     time.sleep(6)
-    return driver.current_url
+    return page.url
 
 
 def scan_and_download_tbmt(tbmt_code: str, detail_url: str = None):
-    from selenium import webdriver
-    from selenium.webdriver.chrome.service import Service
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    from webdriver_manager.chrome import ChromeDriverManager
     import shutil
 
     tbmt_dir = os.path.join(CACHE_DIR, f".tmp_{tbmt_code}")
     os.makedirs(tbmt_dir, exist_ok=True)
 
-    _ensure_chrome_debugger()
-
-    opts = Options()
-    opts.add_experimental_option("debuggerAddress", "localhost:9222")
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=opts)
-    driver.switch_to.new_window('tab')
-
+    page = _new_page()
     try:
+        def _prog(msg):
+            _progress_store[tbmt_code] = _progress_store.get(tbmt_code, {"status": "scanning", "progress": "", "files": []})
+            _progress_store[tbmt_code]["progress"] = msg
+
         if detail_url:
+            _prog("Navigating to detail page...")
             _sprint(f"1. Navigating directly to detail page for {tbmt_code}...")
-            driver.get(detail_url)
+            page.goto(detail_url, timeout=30000)
             try:
-                WebDriverWait(driver, 8).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".nav-tabs, [class*='tab'], .portlet-body")))
+                page.wait_for_selector(".nav-tabs, [class*='tab'], .portlet-body", timeout=8000)
             except:
                 time.sleep(8)
         else:
+            _prog("Searching for TBMT posting...")
             _sprint(f"1. Searching and navigating to detail page for {tbmt_code}...")
-            url = find_bid_detail_url(driver, tbmt_code)
-            _sprint(f"   URL: {url.encode('ascii','replace').decode()}")
+            url = find_bid_detail_url(page, tbmt_code)
+            _prog("Loading detail page...")
+            _sprint(f"   URL: {url}")
 
+        _prog("Extracting API params...")
         _sprint("2. Extracting HSMT API params and calling API directly...")
         file_items = []
         direct_ok = False
         try:
-            notify_id, process_apply, auth_token, cookies = _extract_hsmt_params(driver)
+            notify_id, process_apply, auth_token, cookies = _extract_hsmt_params(page)
             hsmt_response = _call_hsmt_api_direct(notify_id, process_apply, auth_token, cookies)
             file_items = _parse_hsmt_formvalue(hsmt_response)
             direct_ok = True
@@ -371,41 +702,54 @@ def scan_and_download_tbmt(tbmt_code: str, detail_url: str = None):
             _sprint(f"   Direct API attempt failed: {e}")
             _sprint("   Falling back to XHR interception path...")
 
-        if not direct_ok:
+        if not direct_ok or not file_items:
+            if direct_ok and not file_items:
+                _sprint("   Direct API returned 0 files, falling back to XHR interception...")
+            _prog("Injecting XHR interceptor...")
             _sprint("3. Injecting XHR interceptor...")
-            driver.execute_script(XHR_INTERCEPT_JS)
+            page.evaluate(XHR_INTERCEPT_JS)
 
+            _prog("Waiting for page load...")
             _sprint("4. Waiting for initial page load...")
             time.sleep(8)
 
+            _prog("Looking for HSMT tab...")
             _sprint("5. Finding 'Hồ sơ mời thầu' tab...")
             hsmt_tab_clicked = False
-            for el in driver.find_elements(By.CSS_SELECTOR, ".nav-tabs a, ul.nav a, [class*='tab'] a"):
-                text = (el.text or "").strip()
-                href = (el.get_attribute("href") or "").lower()
-                if "hồ sơ mời thầu" in text.lower() or "hs-mt" in href or "hsmot" in href:
-                    driver.execute_script("arguments[0].click();", el)
-                    _sprint(f"   Clicked tab: {text}")
-                    hsmt_tab_clicked = True
-                    time.sleep(4)
-                    break
+            try:
+                tabs = page.locator(".nav-tabs a, ul.nav a, [class*='tab'] a")
+                count = tabs.count()
+                for i in range(count):
+                    el = tabs.nth(i)
+                    text = (el.text_content() or "").strip()
+                    href = (el.get_attribute("href") or "").lower()
+                    if "hồ sơ mời thầu" in text.lower() or "hs-mt" in href or "hsmot" in href:
+                        el.click()
+                        _sprint(f"   Clicked tab: {text}")
+                        hsmt_tab_clicked = True
+                        time.sleep(4)
+                        break
+            except:
+                pass
             if not hsmt_tab_clicked:
                 for tab_sel in ["a[href*='tender-invitation']", "a[href*='notify-contractor-step-1-tbmt']", ".nav-tabs a:nth-child(2)"]:
                     try:
-                        for el in driver.find_elements(By.CSS_SELECTOR, tab_sel):
-                            if el.is_displayed():
-                                driver.execute_script("arguments[0].click();", el)
-                                _sprint(f"   Fallback tab: {tab_sel}")
-                                time.sleep(4)
-                                break
+                        el = page.locator(tab_sel).first
+                        if el.is_visible():
+                            el.click()
+                            _sprint(f"   Fallback tab: {tab_sel}")
+                            time.sleep(4)
+                            break
                     except:
                         continue
 
+            _prog("Waiting for XHR data...")
             _sprint("6. Waiting for XHR data to arrive...")
             time.sleep(8)
 
+            _prog("Capturing XHR responses...")
             _sprint("7. Capturing XHR responses and extracting file IDs from formValue...")
-            xhr_raw = driver.execute_script("return JSON.stringify(window.__xhrResponses || [])")
+            xhr_raw = page.evaluate("JSON.stringify(window.__xhrResponses || [])")
             xhr_data = json.loads(xhr_raw) if xhr_raw else []
 
             if xhr_data:
@@ -447,8 +791,10 @@ def scan_and_download_tbmt(tbmt_code: str, detail_url: str = None):
             _sprint(f"   Captured {len(xhr_data)} XHR responses, {len(file_items)} file items")
 
         if not file_items:
+            _prog(f"No files found for {tbmt_code}")
             raise Exception(f"No file IDs found in HSMT response for {tbmt_code}")
 
+        _prog("Downloading files from agent...")
         _sprint(">>> Calling agent bulk download API...")
         map_files = {fi["fileId"]: fi["fileName"] for fi in file_items}
         _sprint(f"   mapFiles: {json.dumps(map_files, ensure_ascii=False)[:300]}")
@@ -476,6 +822,7 @@ def scan_and_download_tbmt(tbmt_code: str, detail_url: str = None):
         if zip_data[:4] != b"PK\x03\x04":
             raise Exception(f"Agent returned non-ZIP data ({zip_data[:20]})")
 
+        _prog("Saving ZIP file...")
         _sprint(">>> Saving ZIP file...")
         zip_path = os.path.join(CACHE_DIR, f"{tbmt_code}.zip")
         with open(zip_path, "wb") as f:
@@ -488,6 +835,8 @@ def scan_and_download_tbmt(tbmt_code: str, detail_url: str = None):
         results = []
         for fn in file_names:
             info = zf.getinfo(fn)
+            if info.is_dir():
+                continue
             results.append({"filename": fn, "path": zip_path, "size": info.file_size})
             _sprint(f"   + {fn.encode('ascii','replace').decode()} ({info.file_size} bytes)")
 
@@ -502,9 +851,7 @@ def scan_and_download_tbmt(tbmt_code: str, detail_url: str = None):
 
     finally:
         try:
-            driver.close()
-            if len(driver.window_handles) > 0:
-                driver.switch_to.window(driver.window_handles[0])
+            page.close()
         except:
             pass
         try:
@@ -512,6 +859,8 @@ def scan_and_download_tbmt(tbmt_code: str, detail_url: str = None):
         except:
             pass
 
+
+# === FastAPI Endpoints ===
 
 @app.post("/api/scan")
 def api_scan_json(body: dict, background_tasks: BackgroundTasks):
