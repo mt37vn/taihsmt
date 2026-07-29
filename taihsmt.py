@@ -513,7 +513,7 @@ def _load_daily_state():
                 return json.load(f)
         except:
             pass
-    return {"last_run": None, "next_run": None, "status": "idle", "last_total_projects": 0, "last_new_projects": 0, "last_results": {}}
+    return {"last_run": None, "next_run": None, "status": "idle", "last_total_projects": 0, "last_new_projects": 0, "last_results": {}, "failed_codes": []}
 
 def _save_daily_state(state):
     with open(_DAILY_SCAN_FILE, "w", encoding="utf-8") as f:
@@ -905,7 +905,8 @@ def _run_daily_scan():
             _save_daily_state(state)
             return {"error": str(e)}
         idx = _load_tbmt_index()
-        new_codes = [c for c in all_codes if c not in idx]
+        failed = set(state.get("failed_codes", []))
+        new_codes = [c for c in all_codes if c not in idx and c not in failed]
         _sprint(f"[daily-scan] {len(new_codes)} new projects (of {len(all_codes)} total)")
         state["last_total_projects"] = len(all_codes)
         state["last_new_projects"] = len(new_codes)
@@ -922,7 +923,13 @@ def _run_daily_scan():
             _save_daily_state(state)
             while _manual_waiting.is_set():
                 _sprint(f"[daily-scan] Manual scan in progress, waiting 10s...")
+                state["status"] = "paused"
+                state["last_results"][code] = "cho manual"
+                _save_daily_state(state)
                 time.sleep(10)
+            state["status"] = "running"
+            state["last_results"][code] = "scanning"
+            _save_daily_state(state)
             try:
                 result = scan_and_download_tbmt(code)
                 files = [r["filename"] for r in result]
@@ -930,6 +937,8 @@ def _run_daily_scan():
                 _sprint(f"[daily-scan] {code}: {len(files)} files downloaded")
             except Exception as e:
                 state["last_results"][code] = f"error: {e}"
+                if "failed_codes" not in state: state["failed_codes"] = []
+                if code not in state["failed_codes"]: state["failed_codes"].append(code)
                 _sprint(f"[daily-scan] {code}: FAILED - {e}")
             _save_daily_state(state)
             if i < len(new_codes) - 1:
@@ -953,6 +962,14 @@ def _daily_scan_loop():
 
 @app.on_event("startup")
 def _start_daily_scheduler():
+    state = _load_daily_state()
+    if state.get("status") in ("running", "completed"):
+        _sprint("[daily-scan] Clearing stale state on startup")
+    state["status"] = "idle"
+    state["last_results"] = {}
+    state["next_run"] = None
+    if "failed_codes" not in state: state["failed_codes"] = []
+    _save_daily_state(state)
     t = threading.Thread(target=_daily_scan_loop, daemon=True)
     t.start()
     _sprint("[daily-scan] Scheduler started (first run in 60s)")
@@ -1079,14 +1096,14 @@ def api_status():
         pass
 
     idx = _load_tbmt_index()
-    cache_files = [f for f in os.listdir(CACHE_DIR) if not f.startswith(".") and not f.startswith(".tmp")]
-    total_size = sum(os.path.getsize(os.path.join(CACHE_DIR, f)) for f in cache_files if os.path.isfile(os.path.join(CACHE_DIR, f)) and not f.endswith(".json") and not f.endswith(".zip"))
+    zip_files = [f for f in os.listdir(CACHE_DIR) if f.endswith(".zip")]
+    total_size = sum(os.path.getsize(os.path.join(CACHE_DIR, f)) for f in zip_files if os.path.isfile(os.path.join(CACHE_DIR, f)))
 
     return {
         "agent": {"running": agent_ok, "url": AGENT_BASE_URL},
         "cache": {
             "directory": CACHE_DIR,
-            "file_count": len([f for f in cache_files if not f.endswith(".json") and not f.endswith(".zip")]),
+            "file_count": len(zip_files),
             "tbmt_codes": list(idx.keys()),
             "size_mb": round(total_size / (1024 * 1024), 2),
         },
@@ -1122,17 +1139,73 @@ def api_cached_files():
 
 @app.get("/api/daily-scan")
 def api_daily_scan_status():
-    return _load_daily_state()
+    state = _load_daily_state()
+    if _daily_scan_lock.locked() and state.get("status") != "running":
+        state["status"] = "running"
+    return state
+
+
+@app.get("/api/daily-scan/preview")
+def api_daily_scan_preview():
+    try:
+        resp = req_lib.get(HAPROINFO_URL, timeout=15, verify=False)
+        data = resp.json()
+        projects = data.get("projects", [])
+        all_codes = [p["maDauThau"] for p in projects]
+    except Exception as e:
+        raise HTTPException(502, f"Failed to fetch haproinfo: {e}")
+    idx = _load_tbmt_index()
+    state = _load_daily_state()
+    failed = set(state.get("failed_codes", []))
+    new_codes = [c for c in all_codes if c not in idx and c not in failed]
+    return {"total": len(all_codes), "new": new_codes, "new_count": len(new_codes)}
 
 
 @app.post("/api/daily-scan/run")
 def api_daily_scan_run(background_tasks: BackgroundTasks):
     if _daily_scan_lock.locked():
-        raise HTTPException(409, "Daily scan already running")
+        state = _load_daily_state()
+        return {"status": state.get("status", "running"), "message": "Already running"}
     def _bg():
         _run_daily_scan()
     background_tasks.add_task(_bg)
     return {"status": "started", "message": "Daily scan started in background"}
+
+
+@app.post("/api/daily-scan/retry")
+def api_daily_scan_retry(background_tasks: BackgroundTasks, body: dict = {}):
+    code = (body.get("code") or "").strip() if body else ""
+    state = _load_daily_state()
+    failed = state.get("failed_codes", [])
+    if code:
+        if code not in failed:
+            raise HTTPException(404, f"{code} not in failed list")
+        targets = [code]
+    else:
+        targets = list(failed)
+    if not targets:
+        raise HTTPException(400, "No failed codes to retry")
+    def _bg():
+        for c in targets:
+            _sprint(f"[retry] Retrying {c}...")
+            try:
+                with _scanner_lock:
+                    result = scan_and_download_tbmt(c)
+                st = _load_daily_state()
+                st["failed_codes"] = [x for x in st.get("failed_codes", []) if x != c]
+                st["last_results"][c] = "done"
+                _save_daily_state(st)
+                _sprint(f"[retry] {c}: OK ({len(result)} files)")
+            except Exception as e:
+                _sprint(f"[retry] {c}: FAILED - {e}")
+    background_tasks.add_task(_bg)
+    return {"status": "started", "targets": targets}
+
+
+@app.get("/api/daily-scan/failed")
+def api_daily_scan_failed():
+    state = _load_daily_state()
+    return {"failed_codes": state.get("failed_codes", [])}
 
 
 @app.get("/download")
@@ -1192,15 +1265,20 @@ def index():
 </div>
 <div id="adminContent" class="hidden mt-3">
 <div class="flex items-center justify-between mb-3">
-<button onclick="load();refreshStatus()" class="text-blue-600 text-sm hover:underline min-h-[44px]">Refresh cache</button>
+<button onclick="load();" class="text-blue-600 text-sm hover:underline min-h-[44px]">Refresh cache</button>
 <button onclick="runDaily()" class="bg-emerald-600 text-white px-4 py-2.5 sm:py-1.5 rounded-lg hover:bg-emerald-700 text-xs font-medium min-h-[44px]">Chay tu dong</button></div>
-<div id="agentStatus" class="text-xs text-slate-400 mb-2"></div>
-<div class="overflow-x-auto mb-4">
+<div id="dailyStatus" class="text-xs text-slate-500 mb-2"></div>
+<div class="flex gap-1 mb-2 border-b">
+<button id="tabActive" onclick="switchTab('active')" class="px-3 py-1.5 text-xs font-medium border-b-2 border-blue-600 text-blue-600">Dang xu ly</button>
+<button id="tabFailed" onclick="switchTab('failed')" class="px-3 py-1.5 text-xs font-medium text-slate-400">Loi <span id="failedCount" class="ml-0.5"></span></button>
+</div>
+<div id="activeTable" class="overflow-x-auto">
 <table class="w-full text-sm"><thead><tr class="text-left text-slate-400"><th>File</th><th>Kich thuoc</th><th>Ngay</th><th></th></tr></thead><tbody id="cb"></tbody></table>
 </div>
-<div id="dailyStatus" class="text-xs text-slate-500 mb-2">Dang tai...</div>
-<div id="dailyResults" class="text-xs max-h-32 overflow-y-auto"></div>
-</div></div>
+<div id="failedTable" class="overflow-x-auto hidden">
+<div class="flex justify-end mb-1"><button onclick="retryFailed()" class="text-blue-600 text-xs hover:underline min-h-[44px]">Retry tat ca</button></div>
+<table class="w-full text-sm"><thead><tr class="text-left text-slate-400"><th>Ma TBMT</th><th>Loi</th><th></th></tr></thead><tbody id="cbFailed"></tbody></table>
+</div></div></div>
 
 </div>
 <script>
@@ -1209,7 +1287,7 @@ function checkPw(){
     sessionStorage.setItem('vnegp_auth','1');
     document.getElementById('loginOverlay').classList.add('hidden');
     document.getElementById('app').classList.remove('hidden');
-    loadDaily();refreshStatus();load();
+    loadDaily();load();
   }else{
     const e=document.getElementById('pwError');
     e.classList.remove('hidden');
@@ -1226,7 +1304,7 @@ function toggleAdmin(){
   const ch=document.getElementById('adminChevron');
   const open=!c.classList.toggle('hidden');
   ch.innerHTML=open?'&#9660;':'&#9654;';
-  if(open){load();refreshStatus();}
+  if(open){load();loadDaily();}
 }
 window.tbmtCacheMap={};
 let debounceTimer;
@@ -1266,6 +1344,19 @@ function selectSuggestion(id){
   document.getElementById('suggestions').classList.add('hidden');
   doSearch(id);
 }
+let activeTab='active';
+function switchTab(tab){
+  activeTab=tab;
+  document.getElementById('activeTable').classList.toggle('hidden',tab!=='active');
+  document.getElementById('failedTable').classList.toggle('hidden',tab!=='failed');
+  document.getElementById('tabActive').className='px-3 py-1.5 text-xs font-medium border-b-2'+(tab==='active'?' border-blue-600 text-blue-600':' border-transparent text-slate-400');
+  document.getElementById('tabFailed').className='px-3 py-1.5 text-xs font-medium border-b-2'+(tab==='failed'?' border-blue-600 text-blue-600':' border-transparent text-slate-400');
+}
+async function retryFailed(){
+  const b=event.target;b.disabled=true;b.textContent='Dang retry...';
+  try{const r=await fetch('/api/daily-scan/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});const d=await r.json();if(!r.ok)throw new Error(d.detail||'Failed');
+  setTimeout(()=>{load();loadDaily();},2000);}catch(e){alert(e.message);}
+  setTimeout(()=>{b.disabled=false;b.textContent='Retry tat ca';},5000);}
 document.getElementById('tbmt').addEventListener('input',function(){
   clearTimeout(debounceTimer);
   debounceTimer=setTimeout(()=>{doSearch(this.value.trim().toUpperCase());},300);
@@ -1278,20 +1369,38 @@ document.getElementById('tbmt').addEventListener('focus',function(){
   if(v&&!window.tbmtCacheMap[v])doSearch(v);
 });
 async function loadDaily(){try{const r=await fetch('/api/daily-scan');const d=await r.json();
-const s=d.status||'idle';const colors={idle:'text-slate-400',running:'text-blue-600',completed:'text-green-600',failed:'text-red-600'};
-document.getElementById('dailyStatus').innerHTML='Trang thai: <span class="'+(colors[s]||'')+' font-medium">'+s+'</span> | Tong: '+d.last_total_projects+' | Moi: '+d.last_new_projects+(d.last_run?' | Luc: '+d.last_run:'');
-let h='';const rs=d.last_results||{};for(const[k,v]of Object.entries(rs)){h+='<div class="'+(v==='done'?'text-green-600':v.startsWith('error')?'text-red-600':'text-blue-600')+'">'+k+': '+v+'</div>';}
-document.getElementById('dailyResults').innerHTML=h;}catch(e){document.getElementById('dailyStatus').textContent='Loi: '+e.message;}}
-async function runDaily(){const b=event.target;b.disabled=true;b.textContent='Dang chay...';
-try{const r=await fetch('/api/daily-scan/run',{method:'POST'});const d=await r.json();if(!r.ok)throw new Error(d.detail||'Failed');}
+const s=d.status||'idle';const c={idle:'text-slate-400',running:'text-blue-600',paused:'text-amber-600',completed:'text-green-600',failed:'text-red-600'};
+let txt='Trang thai: <span class="'+(c[s]||'')+' font-medium">'+s+'</span> | Tong: '+d.last_total_projects+' | Moi: '+d.last_new_projects+(d.last_run?' | Luc: '+d.last_run:'');
+const sr=await fetch('/api/status');const sd=await sr.json();
+txt+=' | Cache: '+sd.cache.file_count+' files, '+sd.cache.size_mb+' MB';
+document.getElementById('dailyStatus').innerHTML=txt;}catch(e){document.getElementById('dailyStatus').textContent='Loi: '+e.message;}}
+async function runDaily(){const b=event.target;b.disabled=true;b.textContent='Dang kiem tra...';
+try{const p=await fetch('/api/daily-scan/preview');const pj=await p.json();
+if(!pj.new_count){alert('Khong co du an moi can cap nhat');b.disabled=false;b.textContent='Chay tu dong';return;}
+await load();b.textContent='Dang chay...';
+const r=await fetch('/api/daily-scan/run',{method:'POST'});const d=await r.json();if(!r.ok)throw new Error(d.detail||'Failed');}
 catch(e){alert(e.message);}b.disabled=false;b.textContent='Chay tu dong';
 setTimeout(loadDaily,2000);}
 async function load(){const r=await fetch('/api/cached-files');const d=await r.json();
 window.tbmtCacheMap={};d.forEach(f=>{window.tbmtCacheMap[f.tbmt_id]=f;});
-document.getElementById('cb').innerHTML=d.length===0?'<tr><td colspan="4" class="text-center py-4 text-slate-400">Trong</td></tr>':
-d.map(f=>'<tr class="border-t"><td class="py-2 font-mono text-blue-600 max-w-xs truncate">'+f.filename+'</td><td class="py-2 text-slate-500">'+f.size+'</td><td class="py-2 text-slate-400 text-xs">'+f.created_at+'</td><td class="py-2"><a href="/download?tbmt_id='+f.tbmt_id+'" class="text-emerald-600 font-medium">Tai</a></td></tr>').join('');}
-async function refreshStatus(){const r=await fetch('/api/status');const d=await r.json();
-document.getElementById('agentStatus').textContent='Agent: '+(d.agent.running?'Online':'Offline')+' | Cache: '+d.cache.file_count+' files, '+d.cache.size_mb+' MB | Cooldown: '+d.scanner.cooldown_sec+'s | TBMT: '+(d.cache.tbmt_codes.join(', ')||'(none)');}
+const dr=await fetch('/api/daily-scan');const ds=await dr.json();
+const rs=ds.last_results||{};const seen=new Set(d.map(f=>f.tbmt_id));
+const d_rows=Object.entries(rs).filter(([k])=>!seen.has(k)).map(([k,v])=>{
+  const sc=v==='done'?'text-green-600':v.startsWith('error')||v==='cho manual'?'text-amber-600':'text-blue-600';
+  const lb=v==='done'?'xong':v.startsWith('error')?'loi':v==='cho manual'?'cho manual':'dang scan';
+  return '<tr class="border-t"><td class="py-2 font-mono max-w-xs truncate '+sc+'">'+k+'</td><td class="py-2 text-slate-400">-</td><td class="py-2 text-slate-400 text-xs">-</td><td class="py-2"><span class="text-xs '+sc+'">'+lb+'</span></td></tr>';
+}).join('');
+document.getElementById('cb').innerHTML=d.length===0&&!d_rows?'<tr><td colspan="4" class="text-center py-4 text-slate-400">Trong</td></tr>':
+d_rows+d.map(f=>'<tr class="border-t"><td class="py-2 font-mono text-blue-600 max-w-xs truncate">'+f.filename+'</td><td class="py-2 text-slate-500">'+f.size+'</td><td class="py-2 text-slate-400 text-xs">'+f.created_at+'</td><td class="py-2"><a href="/download?tbmt_id='+f.tbmt_id+'" class="text-emerald-600 font-medium">Tai</a></td></tr>').join('');
+const fr=await fetch('/api/daily-scan/failed');const fj=await fr.json();
+const fc=fj.failed_codes||[];const fseen=new Set(d.map(f=>f.tbmt_id));
+const f_rows=fc.filter(k=>!fseen.has(k)).map(k=>{
+  const err=(rs[k]||'').replace('error: ','');
+  return '<tr class="border-t"><td class="py-2 font-mono text-red-600">'+k+'</td><td class="py-2 text-xs text-slate-500 max-w-xs truncate">'+err+'</td><td class="py-2"><button onclick="retryOne(\\''+k+'\\')" class="text-blue-600 text-xs hover:underline">Retry</button></td></tr>';
+}).join('');
+document.getElementById('cbFailed').innerHTML=fc.length===0?'<tr><td colspan="3" class="text-center py-4 text-slate-400">Khong co loi</td></tr>':f_rows;
+document.getElementById('failedCount').textContent=fc.length?'('+fc.length+')':'';}
+async function retryOne(c){try{const r=await fetch('/api/daily-scan/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:c})});if(!r.ok)return;}catch(e){}setTimeout(()=>{load();loadDaily();},2000);}
 async function scan(){const id=document.getElementById('tbmt').value.trim().toUpperCase();if(!id)return alert('Nhap ma TBMT');
 const b=document.getElementById('scanBtn');const s=document.getElementById('status');
 b.disabled=true;b.textContent='Dang scan...';
@@ -1306,8 +1415,9 @@ const sr=await fetch('/api/scan/'+encodeURIComponent(pollId)+'/status');const sd
 s.innerHTML='<span class="'+(sd.status==='done'?'text-green-600':sd.status==='error'?'text-red-600':'text-blue-600')+'">'+sd.status.toUpperCase()+': '+sd.progress+' ('+sd.files.length+' files)</span>';
 if(sd.status==='done'||sd.status==='error'||p>180){clearInterval(poll);
 b.disabled=false;b.textContent='Scan & Tai';b.classList.add('hidden');
-if(sd.status==='done'){await load();loadDaily();refreshStatus();const exact=window.tbmtCacheMap[id];if(exact){document.getElementById('resultInfo').textContent='File: '+exact.filename+' ('+exact.size+') | '+exact.created_at;document.getElementById('resultLink').href='/download?tbmt_id='+encodeURIComponent(id);document.getElementById('result').classList.remove('hidden');s.classList.add('hidden');}}}},2000);}
+if(sd.status==='done'){await load();loadDaily();const exact=window.tbmtCacheMap[id];if(exact){document.getElementById('resultInfo').textContent='File: '+exact.filename+' ('+exact.size+') | '+exact.created_at;document.getElementById('resultLink').href='/download?tbmt_id='+encodeURIComponent(id);document.getElementById('result').classList.remove('hidden');s.classList.add('hidden');}}}},2000);}
 catch(e){s.innerHTML='<span class="text-red-600">Error: '+e.message+'</span>';b.disabled=false;b.textContent='Scan & Tai';}}
+if(sessionStorage.getItem('vnegp_auth')==='1'){loadDaily();load();}
 </script></body></html>""")
 
 
