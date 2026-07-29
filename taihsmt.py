@@ -24,6 +24,9 @@ _scanner_lock = threading.Lock()
 _last_scan_time = 0.0
 MIN_SCAN_INTERVAL = 30
 
+_DAILY_SCAN_FILE = os.path.join(CACHE_DIR, "_daily_scan.json")
+_daily_scan_lock = threading.Lock()
+
 # --- Playwright lifecycle ---
 _pw = None
 _pw_browser = None
@@ -502,6 +505,19 @@ def _save_tbmt_index(idx):
     with open(TBMT_CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(idx, f, ensure_ascii=False, indent=2)
 
+def _load_daily_state():
+    if os.path.exists(_DAILY_SCAN_FILE):
+        try:
+            with open(_DAILY_SCAN_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            pass
+    return {"last_run": None, "next_run": None, "status": "idle", "last_total_projects": 0, "last_new_projects": 0, "last_results": {}}
+
+def _save_daily_state(state):
+    with open(_DAILY_SCAN_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
 def _call_hsmt_api_direct(notify_id, process_apply, auth_token, cookies):
     api_url = f"{PORTAL_BASE}{HSMT_API_PATH}?token={auth_token}"
     payload = {"id": notify_id, "processApply": process_apply}
@@ -860,6 +876,83 @@ def scan_and_download_tbmt(tbmt_code: str, detail_url: str = None):
             pass
 
 
+# === Daily Auto-Scan from haproinfo ===
+
+HAPROINFO_URL = "https://tinhgiathau.haproinfo.vn/api/project-ids"
+
+def _run_daily_scan():
+    if _daily_scan_lock.locked():
+        _sprint("[daily-scan] Already running, skipped")
+        return {"error": "Already running"}
+    with _daily_scan_lock:
+        _sprint("[daily-scan] Starting...")
+        state = _load_daily_state()
+        state["status"] = "running"
+        state["last_results"] = {}
+        _save_daily_state(state)
+        try:
+            resp = req_lib.get(HAPROINFO_URL, timeout=15, verify=False)
+            data = resp.json()
+            projects = data.get("projects", [])
+            all_codes = [p["maDauThau"] for p in projects]
+            _sprint(f"[daily-scan] haproinfo returned {len(all_codes)} projects")
+        except Exception as e:
+            _sprint(f"[daily-scan] Failed to fetch haproinfo API: {e}")
+            state["status"] = "failed"
+            state["last_run"] = datetime.now().isoformat()
+            state["next_run"] = time.time() + 86400
+            _save_daily_state(state)
+            return {"error": str(e)}
+        idx = _load_tbmt_index()
+        new_codes = [c for c in all_codes if c not in idx]
+        _sprint(f"[daily-scan] {len(new_codes)} new projects (of {len(all_codes)} total)")
+        state["last_total_projects"] = len(all_codes)
+        state["last_new_projects"] = len(new_codes)
+        state["last_run"] = datetime.now().isoformat()
+        if not new_codes:
+            _sprint("[daily-scan] No new projects to scan")
+            state["status"] = "completed"
+            state["next_run"] = (datetime.now().timestamp() + 86400)
+            _save_daily_state(state)
+            return {"total": len(all_codes), "new": 0, "results": {}}
+        for i, code in enumerate(new_codes):
+            _sprint(f"[daily-scan] [{i+1}/{len(new_codes)}] Scanning {code}...")
+            state["last_results"][code] = "scanning"
+            _save_daily_state(state)
+            try:
+                result = scan_and_download_tbmt(code)
+                files = [r["filename"] for r in result]
+                state["last_results"][code] = "done"
+                _sprint(f"[daily-scan] {code}: {len(files)} files downloaded")
+            except Exception as e:
+                state["last_results"][code] = f"error: {e}"
+                _sprint(f"[daily-scan] {code}: FAILED - {e}")
+            _save_daily_state(state)
+            if i < len(new_codes) - 1:
+                _sprint(f"[daily-scan] Cooldown 30s before next scan...")
+                time.sleep(30)
+        _sprint(f"[daily-scan] Complete - {len(new_codes)} projects processed")
+        state["status"] = "completed"
+        state["next_run"] = time.time() + 86400
+        _save_daily_state(state)
+        return {"total": len(all_codes), "new": len(new_codes), "results": state["last_results"]}
+
+def _daily_scan_loop():
+    time.sleep(60)
+    while True:
+        _run_daily_scan()
+        state = _load_daily_state()
+        next_ts = state.get("next_run") or time.time() + 86400
+        delay = max(60, next_ts - time.time())
+        _sprint(f"[daily-scan] Next run in {int(delay)}s")
+        time.sleep(delay)
+
+@app.on_event("startup")
+def _start_daily_scheduler():
+    t = threading.Thread(target=_daily_scan_loop, daemon=True)
+    t.start()
+    _sprint("[daily-scan] Scheduler started (first run in 60s)")
+
 # === FastAPI Endpoints ===
 
 @app.post("/api/scan")
@@ -1020,6 +1113,21 @@ def api_cached_files():
     return files
 
 
+@app.get("/api/daily-scan")
+def api_daily_scan_status():
+    return _load_daily_state()
+
+
+@app.post("/api/daily-scan/run")
+def api_daily_scan_run(background_tasks: BackgroundTasks):
+    if _daily_scan_lock.locked():
+        raise HTTPException(409, "Daily scan already running")
+    def _bg():
+        _run_daily_scan()
+    background_tasks.add_task(_bg)
+    return {"status": "started", "message": "Daily scan started in background"}
+
+
 @app.get("/download")
 def download(tbmt_id: str, force_refresh: bool = False):
     tid = tbmt_id.strip()
@@ -1040,42 +1148,159 @@ def download(tbmt_id: str, force_refresh: bool = False):
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return HTMLResponse("""<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8"><title>VNeGP Downloader</title>
-<script src="https://cdn.tailwindcss.com"></script></head><body class="bg-slate-50 min-h-screen p-8">
-<div class="max-w-3xl mx-auto">
-<div class="bg-white p-6 rounded-xl shadow-sm mb-6">
-<h1 class="text-2xl font-bold mb-2">VNeGP Downloader</h1>
-<p class="text-slate-500 text-sm mb-6">Tu dong tai ho so moi thau tu muasamcong.mpi.gov.vn</p>
-<div class="mb-4"><input id="tbmt" placeholder="Nhap ma TBMT (VD: IB2600363942)" class="w-full px-4 py-2 border rounded-lg font-mono text-sm"></div>
-<div class="flex">
-<button onclick="scan()" class="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 text-sm font-medium">Scan & Tai</button>
-</div>
-<div id="status" class="mt-4 text-sm hidden"></div>
-</div>
-<div class="bg-white p-6 rounded-xl shadow-sm">
-<div class="flex items-center justify-between mb-4"><h2 class="text-lg font-semibold">Kho cache</h2><button onclick="load();refreshStatus()" class="text-blue-600 text-sm hover:underline">Refresh</button></div>
-<div id="agentStatus" class="text-xs text-slate-400 mb-3"></div>
-<table class="w-full text-sm"><thead><tr class="text-left text-slate-400"><th>File</th><th>Kich thuoc</th><th>Ngay</th><th></th></tr></thead><tbody id="cb"></tbody></table>
+    return HTMLResponse("""<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>VNeGP Downloader</title>
+<script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-slate-50 min-h-screen p-3 sm:p-8">
+<div id="loginOverlay" class="fixed inset-0 z-50 flex items-center justify-center bg-slate-800/80">
+<div class="bg-white p-6 rounded-xl shadow-xl w-80 max-w-full">
+<h2 class="text-lg font-bold mb-4">VNeGP Downloader</h2>
+<input id="pwInput" type="password" placeholder="Mat khau" autocomplete="off" class="w-full px-4 py-2.5 border rounded-lg text-sm mb-3 min-h-[44px]">
+<button onclick="checkPw()" class="w-full bg-blue-600 text-white py-2.5 rounded-lg hover:bg-blue-700 text-sm font-medium min-h-[44px]">Vao trang</button>
+<div id="pwError" class="text-red-600 text-xs mt-2 hidden">Sai mat khau</div>
 </div></div>
+<div id="app" class="hidden max-w-full sm:max-w-3xl mx-auto">
+
+<div class="bg-white p-4 sm:p-6 rounded-xl shadow-sm mb-4 sm:mb-6">
+<h1 class="text-xl sm:text-2xl font-bold mb-1">VNeGP Downloader</h1>
+<p class="text-slate-500 text-xs sm:text-sm mb-4 sm:mb-6">Tu dong tai ho so moi thau tu muasamcong.mpi.gov.vn</p>
+<div class="relative mb-3">
+<input id="tbmt" placeholder="Nhap ma TBMT (VD: IB2600363942)" autocomplete="off" class="w-full px-4 py-2.5 sm:py-2 border rounded-lg font-mono text-sm min-h-[44px]">
+<div id="suggestions" class="absolute z-10 w-full bg-white border rounded-lg mt-1 shadow-lg max-h-48 overflow-y-auto hidden"></div>
+</div>
+<div id="result" class="hidden mb-3 p-3 bg-emerald-50 border border-emerald-200 rounded-lg">
+<div class="text-emerald-700 font-medium text-sm mb-1">Da co trong cache &#10003;</div>
+<div id="resultInfo" class="text-xs text-slate-500 mb-2"></div>
+<a id="resultLink" href="#" class="inline-block bg-emerald-600 text-white px-5 py-2.5 sm:py-2 rounded-lg hover:bg-emerald-700 text-sm font-medium min-h-[44px]">Tai xuong</a>
+</div>
+<button id="scanBtn" onclick="scan()" class="hidden bg-blue-600 text-white px-6 py-2.5 sm:py-2 rounded-lg hover:bg-blue-700 text-sm font-medium min-h-[44px]">Scan & Tai</button>
+<div id="status" class="mt-3 text-sm hidden"></div>
+</div>
+
+<div class="bg-white p-4 sm:p-6 rounded-xl shadow-sm">
+<div onclick="toggleAdmin()" class="flex items-center justify-between cursor-pointer select-none min-h-[44px]">
+<h2 class="text-base sm:text-lg font-semibold">Quan ly</h2>
+<span id="adminChevron" class="text-slate-400 text-xl transition-transform duration-200">&#9654;</span>
+</div>
+<div id="adminContent" class="hidden mt-3">
+<div class="flex items-center justify-between mb-3">
+<button onclick="load();refreshStatus()" class="text-blue-600 text-sm hover:underline min-h-[44px]">Refresh cache</button>
+<button onclick="runDaily()" class="bg-emerald-600 text-white px-4 py-2.5 sm:py-1.5 rounded-lg hover:bg-emerald-700 text-xs font-medium min-h-[44px]">Chay tu dong</button></div>
+<div id="agentStatus" class="text-xs text-slate-400 mb-2"></div>
+<div class="overflow-x-auto mb-4">
+<table class="w-full text-sm"><thead><tr class="text-left text-slate-400"><th>File</th><th>Kich thuoc</th><th>Ngay</th><th></th></tr></thead><tbody id="cb"></tbody></table>
+</div>
+<div id="dailyStatus" class="text-xs text-slate-500 mb-2">Dang tai...</div>
+<div id="dailyResults" class="text-xs max-h-32 overflow-y-auto"></div>
+</div></div>
+
+</div>
 <script>
+function checkPw(){
+  if(document.getElementById('pwInput').value==='inf0@hapro'){
+    sessionStorage.setItem('vnegp_auth','1');
+    document.getElementById('loginOverlay').classList.add('hidden');
+    document.getElementById('app').classList.remove('hidden');
+    loadDaily();refreshStatus();load();
+  }else{
+    const e=document.getElementById('pwError');
+    e.classList.remove('hidden');
+    setTimeout(()=>e.classList.add('hidden'),2000);
+  }
+}
+if(sessionStorage.getItem('vnegp_auth')==='1'){
+  document.getElementById('loginOverlay').classList.add('hidden');
+  document.getElementById('app').classList.remove('hidden');
+}
+document.getElementById('pwInput').addEventListener('keydown',function(e){if(e.key==='Enter')checkPw();});
+function toggleAdmin(){
+  const c=document.getElementById('adminContent');
+  const ch=document.getElementById('adminChevron');
+  const open=!c.classList.toggle('hidden');
+  ch.innerHTML=open?'&#9660;':'&#9654;';
+  if(open){load();refreshStatus();}
+}
+window.tbmtCacheMap={};
+let debounceTimer;
+function doSearch(val){
+  const suggestEl=document.getElementById('suggestions');
+  const resultEl=document.getElementById('result');
+  const scanBtn=document.getElementById('scanBtn');
+  const statusEl=document.getElementById('status');
+  if(!val){suggestEl.classList.add('hidden');resultEl.classList.add('hidden');scanBtn.classList.add('hidden');statusEl.classList.add('hidden');return;}
+  const exact=window.tbmtCacheMap[val];
+  if(exact){
+    suggestEl.classList.add('hidden');
+    scanBtn.classList.add('hidden');
+    document.getElementById('resultInfo').textContent='File: '+exact.filename+' ('+exact.size+') | '+exact.created_at;
+    document.getElementById('resultLink').href='/download?tbmt_id='+encodeURIComponent(val);
+    resultEl.classList.remove('hidden');
+    statusEl.classList.add('hidden');
+  }else{
+    resultEl.classList.add('hidden');
+    const matches=Object.keys(window.tbmtCacheMap).filter(k=>k.startsWith(val)).slice(0,20);
+    if(matches.length>0){
+      suggestEl.innerHTML=matches.map(k=>{
+        const f=window.tbmtCacheMap[k];
+        return '<div onclick="selectSuggestion(\\''+k+'\\')" class="px-3 py-2.5 sm:py-2 hover:bg-blue-50 cursor-pointer border-b last:border-0 text-sm">'+
+          '<span class="font-mono text-blue-600">'+k+'</span> '+
+          '<span class="text-slate-400 text-xs">'+f.filename+' ('+f.size+')</span></div>';
+      }).join('');
+      suggestEl.classList.remove('hidden');
+    }else{
+      suggestEl.classList.add('hidden');
+    }
+    scanBtn.classList.remove('hidden');
+  }
+}
+function selectSuggestion(id){
+  document.getElementById('tbmt').value=id;
+  document.getElementById('suggestions').classList.add('hidden');
+  doSearch(id);
+}
+document.getElementById('tbmt').addEventListener('input',function(){
+  clearTimeout(debounceTimer);
+  debounceTimer=setTimeout(()=>{doSearch(this.value.trim().toUpperCase());},300);
+});
+document.getElementById('tbmt').addEventListener('blur',function(){
+  setTimeout(()=>document.getElementById('suggestions').classList.add('hidden'),200);
+});
+document.getElementById('tbmt').addEventListener('focus',function(){
+  const v=this.value.trim().toUpperCase();
+  if(v&&!window.tbmtCacheMap[v])doSearch(v);
+});
+async function loadDaily(){try{const r=await fetch('/api/daily-scan');const d=await r.json();
+const s=d.status||'idle';const colors={idle:'text-slate-400',running:'text-blue-600',completed:'text-green-600',failed:'text-red-600'};
+document.getElementById('dailyStatus').innerHTML='Trang thai: <span class="'+(colors[s]||'')+' font-medium">'+s+'</span> | Tong: '+d.last_total_projects+' | Moi: '+d.last_new_projects+(d.last_run?' | Luc: '+d.last_run:'');
+let h='';const rs=d.last_results||{};for(const[k,v]of Object.entries(rs)){h+='<div class="'+(v==='done'?'text-green-600':v.startsWith('error')?'text-red-600':'text-blue-600')+'">'+k+': '+v+'</div>';}
+document.getElementById('dailyResults').innerHTML=h;}catch(e){document.getElementById('dailyStatus').textContent='Loi: '+e.message;}}
+async function runDaily(){const b=event.target;b.disabled=true;b.textContent='Dang chay...';
+try{const r=await fetch('/api/daily-scan/run',{method:'POST'});const d=await r.json();if(!r.ok)throw new Error(d.detail||'Failed');}
+catch(e){alert(e.message);}b.disabled=false;b.textContent='Chay tu dong';
+setTimeout(loadDaily,2000);}
 async function load(){const r=await fetch('/api/cached-files');const d=await r.json();
+window.tbmtCacheMap={};d.forEach(f=>{window.tbmtCacheMap[f.tbmt_id]=f;});
 document.getElementById('cb').innerHTML=d.length===0?'<tr><td colspan="4" class="text-center py-4 text-slate-400">Trong</td></tr>':
 d.map(f=>'<tr class="border-t"><td class="py-2 font-mono text-blue-600 max-w-xs truncate">'+f.filename+'</td><td class="py-2 text-slate-500">'+f.size+'</td><td class="py-2 text-slate-400 text-xs">'+f.created_at+'</td><td class="py-2"><a href="/download?tbmt_id='+f.tbmt_id+'" class="text-emerald-600 font-medium">Tai</a></td></tr>').join('');}
 async function refreshStatus(){const r=await fetch('/api/status');const d=await r.json();
 document.getElementById('agentStatus').textContent='Agent: '+(d.agent.running?'Online':'Offline')+' | Cache: '+d.cache.file_count+' files, '+d.cache.size_mb+' MB | Cooldown: '+d.scanner.cooldown_sec+'s | TBMT: '+(d.cache.tbmt_codes.join(', ')||'(none)');}
-async function scan(){const id=document.getElementById('tbmt').value.trim();if(!id)return alert('Nhap ma TBMT');
-const b=document.querySelector('button');const s=document.getElementById('status');b.disabled=true;b.textContent='Dang scan...';
-s.className='mt-4 text-sm';s.innerHTML='<span class="text-blue-600">Starting...</span>';s.classList.remove('hidden');
+async function scan(){const id=document.getElementById('tbmt').value.trim().toUpperCase();if(!id)return alert('Nhap ma TBMT');
+const b=document.getElementById('scanBtn');const s=document.getElementById('status');
+b.disabled=true;b.textContent='Dang scan...';
+s.className='mt-3 text-sm';s.innerHTML='<span class="text-blue-600">Starting...</span>';s.classList.remove('hidden');
 const apiUrl='/api/scan/'+encodeURIComponent(id);const opts={method:'POST'};
 try{const r=await fetch(apiUrl,opts);if(!r.ok){const e=await r.json();throw new Error(e.detail||e.message);}
-const d=await r.json();const pollId=id||d.tbmt_code;if(d.status==='cached'){s.innerHTML='<span class="text-green-600">Already cached! '+d.files.length+' files</span>';b.disabled=false;b.textContent='Scan & Tai';return;}
+const d=await r.json();const pollId=id||d.tbmt_code;
+if(d.status==='cached'){s.innerHTML='<span class="text-green-600">Already cached! '+d.files.length+' files</span>';b.disabled=false;b.textContent='Scan & Tai';return;}
 s.innerHTML='<span class="text-blue-600">Scan started. Polling...</span>';
 let p=0;const poll=setInterval(async()=>{p++;
 const sr=await fetch('/api/scan/'+encodeURIComponent(pollId)+'/status');const sd=await sr.json();
 s.innerHTML='<span class="'+(sd.status==='done'?'text-green-600':sd.status==='error'?'text-red-600':'text-blue-600')+'">'+sd.status.toUpperCase()+': '+sd.progress+' ('+sd.files.length+' files)</span>';
-if(sd.status==='done'||sd.status==='error'||p>180){clearInterval(poll);b.disabled=false;b.textContent='Scan & Tai';load();refreshStatus();}},2000);}
+if(sd.status==='done'||sd.status==='error'||p>180){clearInterval(poll);
+b.disabled=false;b.textContent='Scan & Tai';b.classList.add('hidden');
+if(sd.status==='done'){loadDaily();load();refreshStatus();setTimeout(()=>{const inp=document.getElementById('tbmt');doSearch(inp.value.trim().toUpperCase());},500);}}},2000);}
 catch(e){s.innerHTML='<span class="text-red-600">Error: '+e.message+'</span>';b.disabled=false;b.textContent='Scan & Tai';}}
-refreshStatus();load();
 </script></body></html>""")
 
 
