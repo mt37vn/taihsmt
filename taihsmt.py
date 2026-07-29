@@ -1385,7 +1385,7 @@ async function load(){const r=await fetch('/api/cached-files');const d=await r.j
 window.tbmtCacheMap={};d.forEach(f=>{window.tbmtCacheMap[f.tbmt_id]=f;});
 const dr=await fetch('/api/daily-scan');const ds=await dr.json();
 const rs=ds.last_results||{};const seen=new Set(d.map(f=>f.tbmt_id));
-const d_rows=Object.entries(rs).filter(([k])=>!seen.has(k)).map(([k,v])=>{
+const d_rows=Object.entries(rs).filter(([k,v])=>!seen.has(k)&&!v.startsWith('error')).map(([k,v])=>{
   const sc=v==='done'?'text-green-600':v.startsWith('error')||v==='cho manual'?'text-amber-600':'text-blue-600';
   const lb=v==='done'?'xong':v.startsWith('error')?'loi':v==='cho manual'?'cho manual':'dang scan';
   return '<tr class="border-t"><td class="py-2 font-mono max-w-xs truncate '+sc+'">'+k+'</td><td class="py-2 text-slate-400">-</td><td class="py-2 text-slate-400 text-xs">-</td><td class="py-2"><span class="text-xs '+sc+'">'+lb+'</span></td></tr>';
