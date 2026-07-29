@@ -23,6 +23,7 @@ _progress_store = {}
 _scanner_lock = threading.Lock()
 _last_scan_time = 0.0
 MIN_SCAN_INTERVAL = 30
+_manual_waiting = threading.Event()
 
 _DAILY_SCAN_FILE = os.path.join(CACHE_DIR, "_daily_scan.json")
 _daily_scan_lock = threading.Lock()
@@ -919,6 +920,9 @@ def _run_daily_scan():
             _sprint(f"[daily-scan] [{i+1}/{len(new_codes)}] Scanning {code}...")
             state["last_results"][code] = "scanning"
             _save_daily_state(state)
+            while _manual_waiting.is_set():
+                _sprint(f"[daily-scan] Manual scan in progress, waiting 10s...")
+                time.sleep(10)
             try:
                 result = scan_and_download_tbmt(code)
                 files = [r["filename"] for r in result]
@@ -1000,6 +1004,7 @@ def _start_scan(code, background_tasks, detail_url=None):
 
     def _run():
         global _last_scan_time
+        _manual_waiting.set()
         try:
             with _scanner_lock:
                 _last_scan_time = time.time()
@@ -1012,6 +1017,8 @@ def _start_scan(code, background_tasks, detail_url=None):
                 }
         except Exception as e:
             _progress_store[code] = {"status": "error", "progress": str(e), "files": []}
+        finally:
+            _manual_waiting.clear()
 
     background_tasks.add_task(_run)
     return {"status": "started", "tbmt_code": code, "cooldown_sec": MIN_SCAN_INTERVAL}
@@ -1299,7 +1306,7 @@ const sr=await fetch('/api/scan/'+encodeURIComponent(pollId)+'/status');const sd
 s.innerHTML='<span class="'+(sd.status==='done'?'text-green-600':sd.status==='error'?'text-red-600':'text-blue-600')+'">'+sd.status.toUpperCase()+': '+sd.progress+' ('+sd.files.length+' files)</span>';
 if(sd.status==='done'||sd.status==='error'||p>180){clearInterval(poll);
 b.disabled=false;b.textContent='Scan & Tai';b.classList.add('hidden');
-if(sd.status==='done'){loadDaily();load();refreshStatus();setTimeout(()=>{const inp=document.getElementById('tbmt');doSearch(inp.value.trim().toUpperCase());},500);}}},2000);}
+if(sd.status==='done'){await load();loadDaily();refreshStatus();const exact=window.tbmtCacheMap[id];if(exact){document.getElementById('resultInfo').textContent='File: '+exact.filename+' ('+exact.size+') | '+exact.created_at;document.getElementById('resultLink').href='/download?tbmt_id='+encodeURIComponent(id);document.getElementById('result').classList.remove('hidden');s.classList.add('hidden');}}}},2000);}
 catch(e){s.innerHTML='<span class="text-red-600">Error: '+e.message+'</span>';b.disabled=false;b.textContent='Scan & Tai';}}
 </script></body></html>""")
 
