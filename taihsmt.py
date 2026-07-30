@@ -3,15 +3,36 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import requests as req_lib
 from requests.adapters import HTTPAdapter
-from datetime import datetime
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from datetime import datetime, timedelta
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from playwright.sync_api import sync_playwright
+from fastapi.security import APIKeyHeader
+
+# --- Load .env file ---
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.isfile(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip().strip("\"'"))
+
+API_KEY = os.environ.get("VNEGP_API_KEY", "")
 
 app = FastAPI(title="VNeGP Downloader")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def verify_api_key(api_key: str = Depends(api_key_header)):
+    if not API_KEY:
+        return
+    if not api_key or api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vnegp_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -901,7 +922,7 @@ def _run_daily_scan():
             _sprint(f"[daily-scan] Failed to fetch haproinfo API: {e}")
             state["status"] = "failed"
             state["last_run"] = datetime.now().isoformat()
-            state["next_run"] = time.time() + 86400
+            state["next_run"] = (datetime.now() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
             _save_daily_state(state)
             return {"error": str(e)}
         idx = _load_tbmt_index()
@@ -914,7 +935,7 @@ def _run_daily_scan():
         if not new_codes:
             _sprint("[daily-scan] No new projects to scan")
             state["status"] = "completed"
-            state["next_run"] = (datetime.now().timestamp() + 86400)
+            state["next_run"] = (datetime.now() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
             _save_daily_state(state)
             return {"total": len(all_codes), "new": 0, "results": {}}
         for i, code in enumerate(new_codes):
@@ -946,12 +967,16 @@ def _run_daily_scan():
                 time.sleep(30)
         _sprint(f"[daily-scan] Complete - {len(new_codes)} projects processed")
         state["status"] = "completed"
-        state["next_run"] = time.time() + 86400
+        state["next_run"] = (datetime.now() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         _save_daily_state(state)
         return {"total": len(all_codes), "new": len(new_codes), "results": state["last_results"]}
 
 def _daily_scan_loop():
-    time.sleep(60)
+    now = datetime.now()
+    next_midnight = datetime(now.year, now.month, now.day) + timedelta(days=1)
+    delay = (next_midnight - now).total_seconds()
+    _sprint(f"[daily-scan] First run in {int(delay)}s (at 00:00 midnight)")
+    time.sleep(delay)
     while True:
         _run_daily_scan()
         state = _load_daily_state()
@@ -972,7 +997,7 @@ def _start_daily_scheduler():
     _save_daily_state(state)
     t = threading.Thread(target=_daily_scan_loop, daemon=True)
     t.start()
-    _sprint("[daily-scan] Scheduler started (first run in 60s)")
+    _sprint("[daily-scan] Scheduler started (first run at midnight 00:00)")
 
 # === FastAPI Endpoints ===
 
@@ -1062,7 +1087,7 @@ def api_scan_status(tbmt_code: str):
     }
 
 
-@app.get("/api/files/{tbmt_code}")
+@app.get("/api/files/{tbmt_code}", dependencies=[Depends(verify_api_key)])
 def api_files(tbmt_code: str):
     code = tbmt_code.strip()
     if not code:
@@ -1294,6 +1319,16 @@ function checkPw(){
     setTimeout(()=>e.classList.add('hidden'),2000);
   }
 }
+// Auto-attach API key to all /api/* requests
+const origFetch = window.fetch;
+window.fetch = function(url, opts){
+  if(typeof url==='string'&&url.startsWith('/api/')){
+    opts=opts||{};
+    opts.headers=opts.headers||{};
+    opts.headers['X-API-Key']=sessionStorage.getItem('vnegp_api_key')||'';
+  }
+  return origFetch.call(this,url,opts);
+};
 if(sessionStorage.getItem('vnegp_auth')==='1'){
   document.getElementById('loginOverlay').classList.add('hidden');
   document.getElementById('app').classList.remove('hidden');
@@ -1423,3 +1458,13 @@ if(sessionStorage.getItem('vnegp_auth')==='1'){loadDaily();load();}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+
+
+
+
+
+
+
+

@@ -1,3 +1,4 @@
 vnegp_cache/
 *.pyc
 __pycache__/
+.env
