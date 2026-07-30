@@ -561,6 +561,48 @@ def _call_hsmt_api_direct(notify_id, process_apply, auth_token, cookies):
         raise Exception(f"HSMT API returned HTTP {resp.status_code}: {resp.text[:200]}")
     return resp.json()
 
+def _extract_offline_dto_files(offline_dto):
+    """Extract file items from bidInvContractorOfflineDTO structure."""
+    if not isinstance(offline_dto, dict):
+        return []
+    items = []
+    seen = set()
+
+    def add(file_id, file_name):
+        if file_id and file_name and _is_valid_uuid(file_id):
+            if file_id not in seen:
+                seen.add(file_id)
+                items.append({"fileId": file_id, "fileName": file_name})
+
+    add(offline_dto.get("fileId"), offline_dto.get("fileName"))
+    add(offline_dto.get("decisionFileId"), offline_dto.get("decisionFileName"))
+    add(offline_dto.get("briefFileId"), offline_dto.get("briefFileName"))
+    add(offline_dto.get("otherFileId"), offline_dto.get("otherFileName"))
+    add(offline_dto.get("fileIdEn"), offline_dto.get("fileNameEn"))
+    add(offline_dto.get("decisionFileIdEn"), offline_dto.get("decisionFileNameEn"))
+    add(offline_dto.get("briefFileIdEn"), offline_dto.get("briefFileNameEn"))
+    add(offline_dto.get("otherFileIdEn"), offline_dto.get("otherFileNameEn"))
+
+    def parse_list_json(raw):
+        if not raw:
+            return
+        try:
+            obj = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError):
+            return
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k.startswith("otherFileId") and v:
+                    suffix = k[len("otherFileId"):]
+                    name_key = f"otherFileName{suffix}"
+                    add(v, obj.get(name_key))
+
+    parse_list_json(offline_dto.get("listOtherFile"))
+    parse_list_json(offline_dto.get("listOtherFileEn"))
+
+    return items
+
+
 def _parse_hsmt_formvalue(response_json):
     file_items = []
     bido_list = response_json.get("bidoInvBiddingDTO") or []
@@ -593,6 +635,13 @@ def _parse_hsmt_formvalue(response_json):
         for fi in found:
             if fi["fileId"] not in {f.get("fileId") for f in file_items}:
                 file_items.append(fi)
+
+    # Fallback: offline DTO structure
+    if not file_items:
+        offline_dto = response_json.get("bidInvContractorOfflineDTO")
+        if offline_dto:
+            file_items = _extract_offline_dto_files(offline_dto)
+
     return file_items
 
 def _extract_hsmt_params(page):
@@ -823,6 +872,19 @@ def scan_and_download_tbmt(tbmt_code: str, detail_url: str = None):
                                 for fi in found:
                                     if fi["fileId"] not in {f.get("fileId") for f in file_items}:
                                         file_items.append(fi)
+                            except:
+                                pass
+
+                        # Fallback: parse bidInvContractorOfflineDTO when formValue not found
+                        if not file_items:
+                            try:
+                                parsed_body = json.loads(body)
+                                offline_dto = parsed_body.get("bidInvContractorOfflineDTO")
+                                if offline_dto:
+                                    off_items = _extract_offline_dto_files(offline_dto)
+                                    for fi in off_items:
+                                        if fi["fileId"] not in {f.get("fileId") for f in file_items}:
+                                            file_items.append(fi)
                             except:
                                 pass
 
