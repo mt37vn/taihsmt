@@ -926,9 +926,10 @@ def _run_daily_scan():
             _save_daily_state(state)
             return {"error": str(e)}
         idx = _load_tbmt_index()
-        failed = set(state.get("failed_codes", []))
-        new_codes = [c for c in all_codes if c not in idx and c not in failed]
-        _sprint(f"[daily-scan] {len(new_codes)} new projects (of {len(all_codes)} total)")
+        failed_map = state.get("failed_codes", {})
+        new_codes = [c for c in all_codes if c not in idx and failed_map.get(c, 0) < 3]
+        retry_codes = [c for c in all_codes if c in failed_map and failed_map.get(c, 0) < 3 and c not in idx]
+        _sprint(f"[daily-scan] {len(new_codes)} new/retry projects (of {len(all_codes)} total, {len(retry_codes)} retries)")
         state["last_total_projects"] = len(all_codes)
         state["last_new_projects"] = len(new_codes)
         state["last_run"] = datetime.now().isoformat()
@@ -955,11 +956,19 @@ def _run_daily_scan():
                 result = scan_and_download_tbmt(code)
                 files = [r["filename"] for r in result]
                 state["last_results"][code] = "done"
+                if code in state.get("failed_codes", {}):
+                    del state["failed_codes"][code]
+                    _sprint(f"[daily-scan] {code}: removed from failed_codes")
                 _sprint(f"[daily-scan] {code}: {len(files)} files downloaded")
             except Exception as e:
                 state["last_results"][code] = f"error: {e}"
-                if "failed_codes" not in state: state["failed_codes"] = []
-                if code not in state["failed_codes"]: state["failed_codes"].append(code)
+                if "failed_codes" not in state: state["failed_codes"] = {}
+                state["failed_codes"][code] = state["failed_codes"].get(code, 0) + 1
+                attempt = state["failed_codes"][code]
+                if attempt >= 3:
+                    _sprint(f"[daily-scan] {code}: FAILED x{attempt} - stopped retrying")
+                else:
+                    _sprint(f"[daily-scan] {code}: FAILED x{attempt} - will retry ({3 - attempt} left)")
                 _sprint(f"[daily-scan] {code}: FAILED - {e}")
             _save_daily_state(state)
             if i < len(new_codes) - 1:
@@ -993,7 +1002,10 @@ def _start_daily_scheduler():
     state["status"] = "idle"
     state["last_results"] = {}
     state["next_run"] = None
-    if "failed_codes" not in state: state["failed_codes"] = []
+    if "failed_codes" not in state:
+        state["failed_codes"] = {}
+    elif isinstance(state["failed_codes"], list):
+        state["failed_codes"] = {c: 1 for c in state["failed_codes"]}
     _save_daily_state(state)
     t = threading.Thread(target=_daily_scan_loop, daemon=True)
     t.start()
@@ -1181,8 +1193,8 @@ def api_daily_scan_preview():
         raise HTTPException(502, f"Failed to fetch haproinfo: {e}")
     idx = _load_tbmt_index()
     state = _load_daily_state()
-    failed = set(state.get("failed_codes", []))
-    new_codes = [c for c in all_codes if c not in idx and c not in failed]
+    failed_map = state.get("failed_codes", {})
+    new_codes = [c for c in all_codes if c not in idx and failed_map.get(c, 0) < 3]
     return {"total": len(all_codes), "new": new_codes, "new_count": len(new_codes)}
 
 
@@ -1201,13 +1213,13 @@ def api_daily_scan_run(background_tasks: BackgroundTasks):
 def api_daily_scan_retry(background_tasks: BackgroundTasks, body: dict = {}):
     code = (body.get("code") or "").strip() if body else ""
     state = _load_daily_state()
-    failed = state.get("failed_codes", [])
+    failed = state.get("failed_codes", {})
     if code:
         if code not in failed:
             raise HTTPException(404, f"{code} not in failed list")
         targets = [code]
     else:
-        targets = list(failed)
+        targets = list(failed.keys())
     if not targets:
         raise HTTPException(400, "No failed codes to retry")
     def _bg():
@@ -1217,7 +1229,8 @@ def api_daily_scan_retry(background_tasks: BackgroundTasks, body: dict = {}):
                 with _scanner_lock:
                     result = scan_and_download_tbmt(c)
                 st = _load_daily_state()
-                st["failed_codes"] = [x for x in st.get("failed_codes", []) if x != c]
+                if c in st.get("failed_codes", {}):
+                    del st["failed_codes"][c]
                 st["last_results"][c] = "done"
                 _save_daily_state(st)
                 _sprint(f"[retry] {c}: OK ({len(result)} files)")
@@ -1230,7 +1243,7 @@ def api_daily_scan_retry(background_tasks: BackgroundTasks, body: dict = {}):
 @app.get("/api/daily-scan/failed")
 def api_daily_scan_failed():
     state = _load_daily_state()
-    return {"failed_codes": state.get("failed_codes", [])}
+    return {"failed_codes": state.get("failed_codes", {})}
 
 
 @app.get("/download")
