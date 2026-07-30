@@ -1222,20 +1222,33 @@ def api_daily_scan_retry(background_tasks: BackgroundTasks, body: dict = {}):
         targets = list(failed.keys())
     if not targets:
         raise HTTPException(400, "No failed codes to retry")
+    state["status"] = "running"
+    _save_daily_state(state)
     def _bg():
-        for c in targets:
-            _sprint(f"[retry] Retrying {c}...")
-            try:
-                with _scanner_lock:
-                    result = scan_and_download_tbmt(c)
+        try:
+            for c in targets:
+                _sprint(f"[retry] Retrying {c}...")
                 st = _load_daily_state()
-                if c in st.get("failed_codes", {}):
-                    del st["failed_codes"][c]
-                st["last_results"][c] = "done"
+                st["last_results"][c] = "scanning"
                 _save_daily_state(st)
-                _sprint(f"[retry] {c}: OK ({len(result)} files)")
-            except Exception as e:
-                _sprint(f"[retry] {c}: FAILED - {e}")
+                try:
+                    with _scanner_lock:
+                        result = scan_and_download_tbmt(c)
+                    st = _load_daily_state()
+                    if c in st.get("failed_codes", {}):
+                        del st["failed_codes"][c]
+                    st["last_results"][c] = "done"
+                    _save_daily_state(st)
+                    _sprint(f"[retry] {c}: OK ({len(result)} files)")
+                except Exception as e:
+                    st = _load_daily_state()
+                    st["last_results"][c] = f"error: {e}"
+                    _save_daily_state(st)
+                    _sprint(f"[retry] {c}: FAILED - {e}")
+        finally:
+            st = _load_daily_state()
+            st["status"] = "idle"
+            _save_daily_state(st)
     background_tasks.add_task(_bg)
     return {"status": "started", "targets": targets}
 
@@ -1442,12 +1455,14 @@ document.getElementById('cb').innerHTML=d.length===0&&!d_rows?'<tr><td colspan="
 d_rows+d.map(f=>'<tr class="border-t"><td class="py-2 font-mono text-blue-600 max-w-xs truncate">'+f.filename+'</td><td class="py-2 text-slate-500">'+f.size+'</td><td class="py-2 text-slate-400 text-xs">'+f.created_at+'</td><td class="py-2"><a href="/download?tbmt_id='+f.tbmt_id+'" class="text-emerald-600 font-medium">Tai</a></td></tr>').join('');
 const fr=await fetch('/api/daily-scan/failed');const fj=await fr.json();
 const fc=fj.failed_codes||[];const fseen=new Set(d.map(f=>f.tbmt_id));
-const f_rows=fc.filter(k=>!fseen.has(k)).map(k=>{
-  const err=(rs[k]||'').replace('error: ','');
-  return '<tr class="border-t"><td class="py-2 font-mono text-red-600">'+k+'</td><td class="py-2 text-xs text-slate-500 max-w-xs truncate">'+err+'</td><td class="py-2"><button onclick="retryOne(\\''+k+'\\')" class="text-blue-600 text-xs hover:underline">Retry</button></td></tr>';
+const fcKeys=Array.isArray(fc)?fc:Object.keys(fc);
+const f_rows=fcKeys.filter(k=>!fseen.has(k)).map(k=>{
+  const retries=fc[k]||1;
+  const err=((rs[k]||'').replace('error: ','')||(retries>1?'Loi lan '+retries:'Chua retry'))+' | Con '+(3-retries)+' lan';
+  return '<tr class="border-t"><td class="py-2 font-mono text-red-600">'+k+'</td><td class="py-2 text-xs text-slate-500 max-w-xs truncate">'+err+'</td><td class="py-2"><button onclick="retryOne(\"'+k+'\")" class="text-blue-600 text-xs hover:underline">Retry</button></td></tr>';
 }).join('');
-document.getElementById('cbFailed').innerHTML=fc.length===0?'<tr><td colspan="3" class="text-center py-4 text-slate-400">Khong co loi</td></tr>':f_rows;
-document.getElementById('failedCount').textContent=fc.length?'('+fc.length+')':'';}
+document.getElementById('cbFailed').innerHTML=fcKeys.length===0?'<tr><td colspan="3" class="text-center py-4 text-slate-400">Khong co loi</td></tr>':f_rows;
+document.getElementById('failedCount').textContent=fcKeys.length?'('+fcKeys.length+')':'';}
 async function retryOne(c){try{const r=await fetch('/api/daily-scan/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:c})});if(!r.ok)return;}catch(e){}setTimeout(()=>{load();loadDaily();},2000);}
 async function scan(){const id=document.getElementById('tbmt').value.trim().toUpperCase();if(!id)return alert('Nhap ma TBMT');
 const b=document.getElementById('scanBtn');const s=document.getElementById('status');
