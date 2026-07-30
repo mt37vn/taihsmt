@@ -1159,7 +1159,7 @@ def api_cached_files():
     idx = _load_tbmt_index()
     for fn in os.listdir(CACHE_DIR):
         fp = os.path.join(CACHE_DIR, fn)
-        if not os.path.isfile(fp) or fn.startswith(".") or fn.startswith(".tmp") or fn.endswith(".json"):
+        if not os.path.isfile(fp) or fn.startswith(".") or fn.startswith(".tmp") or fn.endswith(".json") or fn.endswith(".log"):
             continue
         s = os.stat(fp)
         tbmt_id = fn.replace(".zip", "")
