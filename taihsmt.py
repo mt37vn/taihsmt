@@ -22,6 +22,7 @@ if os.path.isfile(_env_path):
                 os.environ.setdefault(_k.strip(), _v.strip().strip("\"'"))
 
 API_KEY = os.environ.get("VNEGP_API_KEY", "")
+UI_PASSWORD = os.environ.get("VNEGP_UI_PASSWORD", "inf0@hapro")
 
 app = FastAPI(title="VNeGP Downloader")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -1341,7 +1342,7 @@ def download(tbmt_id: str, force_refresh: bool = False):
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return HTMLResponse("""<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8">
+    html = """<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>VNeGP Downloader</title>
 <script src="https://cdn.tailwindcss.com"></script></head>
@@ -1396,7 +1397,7 @@ def index():
 </div>
 <script>
 function checkPw(){
-  if(document.getElementById('pwInput').value==='inf0@hapro'){
+  if(document.getElementById('pwInput').value===__UI_PASSWORD__){
     sessionStorage.setItem('vnegp_auth','1');
     document.getElementById('loginOverlay').classList.add('hidden');
     document.getElementById('app').classList.remove('hidden');
@@ -1543,7 +1544,8 @@ b.disabled=false;b.textContent='Scan & Tai';b.classList.add('hidden');
 if(sd.status==='done'){await load();loadDaily();const exact=window.tbmtCacheMap[id];if(exact){document.getElementById('resultInfo').textContent='File: '+exact.filename+' ('+exact.size+') | '+exact.created_at;document.getElementById('resultLink').href='/download?tbmt_id='+encodeURIComponent(id);document.getElementById('result').classList.remove('hidden');s.classList.add('hidden');}}}},2000);}
 catch(e){s.innerHTML='<span class="text-red-600">Error: '+e.message+'</span>';b.disabled=false;b.textContent='Scan & Tai';}}
 if(sessionStorage.getItem('vnegp_auth')==='1'){loadDaily();load();}
-</script></body></html>""")
+</script></body></html>"""
+    return HTMLResponse(html.replace("__UI_PASSWORD__", json.dumps(UI_PASSWORD)))
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ Tạo file `.env` cùng thư mục với `taihsmt.py`:
 | Biến | Mô tả |
 | --- | --- |
 | `VNEGP_API_KEY` | Khóa bảo vệ endpoint tải file, gửi qua header `X-API-Key`. Để trống nếu không cần xác thực. |
+| `VNEGP_UI_PASSWORD` | Mật khẩu đăng nhập giao diện web. Mặc định `inf0@hapro` nếu không đặt; nên đổi khi triển khai. |
 
 Các giá trị khác (cổng `8000`, thời gian chờ giữa các lần quét, thư mục cache) được khai báo trực tiếp trong mã nguồn.
 
